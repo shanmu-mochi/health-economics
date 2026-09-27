@@ -1,0 +1,684 @@
+/* Medicare Drug Price Explorer — vanilla JS, no dependencies.
+   Data files are built by ../build_data.py from public CMS data. */
+'use strict';
+
+(async function main() {
+  // ---------- tiny DOM helpers (textContent only; labels are untrusted data) ----------
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  function el(tag, attrs = {}, children = []) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (v === null || v === undefined || v === false) continue;
+      if (k === 'class') n.className = v;
+      else if (k === 'text') n.textContent = v;
+      else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
+      else n.setAttribute(k, v === true ? '' : v);
+    }
+    for (const c of [].concat(children)) {
+      if (c === null || c === undefined || c === false) continue;
+      n.append(c.nodeType ? c : document.createTextNode(String(c)));
+    }
+    return n;
+  }
+  function svg(tag, attrs = {}) {
+    const n = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs)) if (v !== null && v !== undefined) n.setAttribute(k, v);
+    return n;
+  }
+  const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  // ---------- load data ----------
+  let PD, PB, NEG, META;
+  try {
+    [PD, PB, NEG, META] = await Promise.all(
+      ['partd', 'partb', 'negotiated', 'meta'].map((n) =>
+        fetch(`data/${n}.json`).then((r) => {
+          if (!r.ok) throw new Error(`${n}.json: HTTP ${r.status}`);
+          return r.json();
+        })
+      )
+    );
+  } catch (err) {
+    $('#detail').replaceChildren(
+      el('div', { class: 'empty' }, [
+        'Could not load the data files (', String(err.message), '). ',
+        'Serve this folder over HTTP (for example ./serve.sh) rather than opening index.html directly.',
+      ])
+    );
+    return;
+  }
+
+  const F = Object.fromEntries(PD.fields.map((f, i) => [f, i]));
+  const YEARS = PD.years.map(String);
+  const LATEST = YEARS[YEARS.length - 1];
+  const PREV = YEARS[YEARS.length - 2];
+  const NEG_BY_KEY = Object.fromEntries(NEG.drugs.map((d) => [d.key, d]));
+  const BY_ID = new Map();
+  for (const d of PD.drugs) BY_ID.set(d.id, d);
+  for (const d of PB.drugs) BY_ID.set(d.id, d);
+
+  $('#yearRange').textContent = `${YEARS[0]}–${LATEST}`;
+  if (META.generated) {
+    const dt = new Date(META.generated);
+    $('#generated').textContent = `Data files built ${dt.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' })}; CMS release covers ${YEARS[0]}–${LATEST}.`;
+  }
+
+  // ---------- value access + formatting ----------
+  const val = (d, year, field) => { const b = d.y[String(year)]; return b ? b[F[field]] : null; };
+  const latest = (d, field) => val(d, LATEST, field);
+  const prev = (d, field) => val(d, PREV, field);
+  const pctChange = (a, b) => (a == null || b == null || b === 0 ? null : a / b - 1);
+
+  const trimZeros = (str) => str.replace(/\.0+(?=[A-Z]?$)/, '').replace(/(\.\d*?)0+(?=[A-Z]?$)/, '$1');
+  const fmtMoney = (v) => {
+    if (v == null || Number.isNaN(v)) return '—';
+    const a = Math.abs(v), s = v < 0 ? '−' : '';
+    if (a >= 1e9) return `${s}$${trimZeros((a / 1e9).toFixed(a >= 1e10 ? 1 : 2))}B`;
+    if (a >= 1e6) return `${s}$${trimZeros((a / 1e6).toFixed(a >= 1e8 ? 0 : 1))}M`;
+    if (a >= 1e4) return `${s}$${Math.round(a / 1e3)}K`;
+    if (a >= 1e3) return `${s}$${trimZeros((a / 1e3).toFixed(1))}K`;
+    return `${s}$${a.toFixed(0)}`;
+  };
+  const fmtPrice = (v) => {
+    if (v == null || Number.isNaN(v)) return '—';
+    const a = Math.abs(v), s = v < 0 ? '−' : '';
+    if (a < 100) return `${s}$${a.toFixed(2)}`;
+    return `${s}$${Math.round(a).toLocaleString('en-US')}`;
+  };
+  const fmtCount = (v) => {
+    if (v == null || Number.isNaN(v)) return '—';
+    const a = Math.abs(v);
+    if (a >= 1e6) return `${(v / 1e6).toFixed(a >= 1e7 ? 1 : 2)}M`;
+    if (a >= 1e4) return `${Math.round(v / 1e3)}K`;
+    return Math.round(v).toLocaleString('en-US');
+  };
+  const fmtInt = (v) => (v == null ? '—' : Math.round(v).toLocaleString('en-US'));
+  const fmtPct = (v, d = 0) => (v == null || Number.isNaN(v) ? '—' : `${(v * 100).toFixed(d)}%`);
+  const fmtSigned = (v) => (v == null || Number.isNaN(v) ? '—' : `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.abs(v * 100).toFixed(1)}%`);
+  const fmtDate = (iso) => new Date(iso + 'T00:00:00').toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+  const METRICS = [
+    { k: 'spend', label: 'Total spending', fmt: fmtMoney, tile: `Total spending, ${LATEST}` },
+    { k: 'benes', label: 'Beneficiaries', fmt: fmtCount, tile: `Beneficiaries, ${LATEST}` },
+    { k: 'claims', label: 'Claims', fmt: fmtCount, tile: `Claims, ${LATEST}` },
+    { k: 'per_claim', label: 'Per claim', fmt: fmtPrice, tile: 'Spending per claim' },
+    { k: 'per_bene', label: 'Per beneficiary', fmt: fmtPrice, tile: 'Spending per beneficiary' },
+    { k: 'per_unit', label: 'Per dosage unit', fmt: fmtPrice, tile: 'Spending per dosage unit' },
+  ];
+  const METRIC = Object.fromEntries(METRICS.map((m) => [m.k, m]));
+  const SORT_LABEL = {
+    spend: `${LATEST} Medicare spending`, benes: `${LATEST} beneficiaries`, per_bene: 'spending per beneficiary',
+    per_unit: 'spending per dosage unit', growth: `per-unit change ${PREV}–${LATEST}`, name: 'name',
+  };
+
+  // ---------- state + URL ----------
+  const state = {
+    view: 'explore', program: 'D', filter: 'all', q: '', sort: 'spend', selected: null,
+    metric: 'spend', shown: 60, trendTable: false, rebate: {}, ovSort: { key: 'gross_spend', dir: -1 }, discTable: false,
+  };
+  function readHash() {
+    const h = new URLSearchParams(location.hash.slice(1));
+    state.view = h.get('view') === 'overview' ? 'overview' : 'explore';
+    const id = h.get('drug');
+    if (id && BY_ID.has(id)) { state.selected = id; state.program = id.startsWith('b:') ? 'B' : 'D'; }
+  }
+  function writeHash() {
+    const h = new URLSearchParams();
+    if (state.view !== 'explore') h.set('view', state.view);
+    if (state.selected) h.set('drug', state.selected);
+    const s = h.toString();
+    history.replaceState(null, '', s ? `#${s}` : location.pathname);
+  }
+
+  // ---------- tooltip ----------
+  const tip = $('#tip');
+  function showTip(ev, rows) {
+    tip.replaceChildren(
+      ...rows.map((r) =>
+        el('div', { class: 'tip-row' }, [
+          r.color ? el('span', { class: 'tip-key', style: `background:${r.color}` }) : null,
+          el('strong', { text: r.value }),
+          el('span', { class: 'tip-label', text: r.label }),
+        ])
+      )
+    );
+    tip.hidden = false;
+    let x, y;
+    if (ev.type === 'focus' || ev.clientX == null) {
+      const b = ev.target.getBoundingClientRect();
+      x = b.left + b.width / 2; y = b.top;
+    } else { x = ev.clientX; y = ev.clientY; }
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    let left = x + 14, top = y + 14;
+    if (left + tw > window.innerWidth - 8) left = x - tw - 14;
+    if (top + th > window.innerHeight - 8) top = y - th - 14;
+    tip.style.left = `${Math.max(8, left)}px`;
+    tip.style.top = `${Math.max(8, top)}px`;
+  }
+  const hideTip = () => { tip.hidden = true; };
+
+  // ---------- charts (inline SVG) ----------
+  function niceScale(max, n = 4) {
+    if (!(max > 0)) return { step: 1, max: 1 };
+    const raw = max / n;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const norm = raw / mag;
+    const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag;
+    return { step, max: Math.ceil(max / step - 1e-9) * step };
+  }
+  const roundedTop = (x, y, w, h, r) =>
+    h <= 0 ? '' : `M${x},${y + h} V${y + r} Q${x},${y} ${x + r},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${y + h} Z`;
+  const roundedRight = (x, y, w, h, r) =>
+    w <= 0 ? '' : `M${x},${y} H${x + w - r} Q${x + w},${y} ${x + w},${y + r} V${y + h - r} Q${x + w},${y + h} ${x + w - r},${y + h} H${x} Z`;
+
+  /** Single-series column chart: years on x. Labels the latest value and the maximum (selective). */
+  function columnChart(container, { labels, values, flags = [], fmt, title }) {
+    container.replaceChildren();
+    const W = Math.max(320, container.clientWidth || 640), H = 250;
+    const m = { t: 30, r: 16, b: 34, l: 62 };
+    const iw = W - m.l - m.r, ih = H - m.t - m.b;
+    const present = values.filter((v) => v != null);
+    const { step, max: ymax } = niceScale(Math.max(0, ...present));
+    const y = (v) => m.t + ih - (v / ymax) * ih;
+    const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: 'img', 'aria-label': `${title} by year` });
+    for (let t = 0; t <= ymax + 1e-9; t += step) {
+      const yy = y(t);
+      s.append(svg('line', { x1: m.l, x2: W - m.r, y1: yy, y2: yy, class: t === 0 ? 'axis' : 'grid' }));
+      const tx = svg('text', { x: m.l - 8, y: yy + 4, class: 'tick', 'text-anchor': 'end' });
+      tx.textContent = t === 0 ? '0' : fmt(t);
+      s.append(tx);
+    }
+    const band = iw / labels.length, bw = Math.min(24, band * 0.5);
+    const maxIdx = present.length ? values.indexOf(Math.max(...present)) : -1;
+    labels.forEach((lab, i) => {
+      const v = values[i], cx = m.l + band * i + band / 2;
+      const xl = svg('text', { x: cx, y: H - m.b + 20, class: 'lab', 'text-anchor': 'middle' });
+      xl.textContent = lab; s.append(xl);
+      if (v == null) {
+        const na = svg('text', { x: cx, y: y(0) - 6, class: 'tick', 'text-anchor': 'middle' });
+        na.textContent = 'n/a'; s.append(na); return;
+      }
+      const top = y(v), h = y(0) - top, r = Math.min(4, h / 2);
+      const bar = svg('path', { d: roundedTop(cx - bw / 2, top, bw, h, r), class: 'bar-fill' });
+      s.append(bar);
+      const isLabelled = i === labels.length - 1 || i === maxIdx;
+      if (isLabelled) {
+        const lbl = svg('text', { x: cx, y: top - 8, class: 'val', 'text-anchor': 'middle' });
+        lbl.textContent = fmt(v) + (flags[i] ? ' ⚑' : ''); s.append(lbl);
+      } else if (flags[i]) {
+        const fl = svg('text', { x: cx, y: top - 8, class: 'flag', 'text-anchor': 'middle' });
+        fl.textContent = '⚑'; s.append(fl);
+      }
+      const hit = svg('rect', { x: m.l + band * i, y: m.t - 10, width: band, height: ih + 10, class: 'hit', tabindex: '0', role: 'graphics-symbol', 'aria-label': `${lab}: ${fmt(v)}${flags[i] ? ' (CMS outlier flag)' : ''}` });
+      const show = (ev) => { bar.classList.add('is-hover'); showTip(ev, [{ value: fmt(v), label: `${title}, ${lab}${flags[i] ? ' · CMS outlier flag' : ''}`, color: cssVar('--s1') }]); };
+      const hide = () => { bar.classList.remove('is-hover'); hideTip(); };
+      hit.addEventListener('pointermove', show); hit.addEventListener('pointerleave', hide);
+      hit.addEventListener('focus', show); hit.addEventListener('blur', hide);
+      s.append(hit);
+    });
+    container.append(s);
+  }
+
+  /** Horizontal bars, one row per item; value label at the tip. rows: {label, value, color, tipRows} */
+  function hbarChart(container, { rows, fmt, rowH = 30, labelWidth }) {
+    container.replaceChildren();
+    const W = Math.max(320, container.clientWidth || 640);
+    const m = { t: 6, r: 72, b: 6, l: labelWidth || Math.min(230, Math.round(W * 0.34)) };
+    const H = m.t + m.b + rows.length * rowH;
+    const iw = W - m.l - m.r;
+    const max = Math.max(...rows.map((r) => r.value || 0), 1e-9);
+    const x = (v) => m.l + (v / max) * iw;
+    const s = svg('svg', { viewBox: `0 0 ${W} ${H}`, width: W, height: H, role: 'img' });
+    s.append(svg('line', { x1: m.l, x2: m.l, y1: m.t, y2: H - m.b, class: 'axis' }));
+    const maxChars = Math.max(6, Math.floor((m.l - 14) / 6.6));
+    rows.forEach((r, i) => {
+      const cy = m.t + rowH * i + rowH / 2, bh = Math.min(18, rowH - 10);
+      const lt = svg('text', { x: m.l - 10, y: cy + 4, class: 'lab', 'text-anchor': 'end' });
+      lt.textContent = r.label.length > maxChars ? r.label.slice(0, maxChars - 1) + '…' : r.label;
+      s.append(lt);
+      const w = Math.max(0, x(r.value) - m.l), rr = Math.min(4, w / 2, bh / 2);
+      const bar = svg('path', { d: roundedRight(m.l, cy - bh / 2, w, bh, rr), class: 'bar-fill' });
+      if (r.color) bar.style.fill = r.color;
+      s.append(bar);
+      const vt = svg('text', { x: x(r.value) + 8, y: cy + 4, class: 'val' });
+      vt.textContent = fmt(r.value); s.append(vt);
+      const hit = svg('rect', { x: 0, y: cy - rowH / 2, width: W, height: rowH, class: 'hit', tabindex: '0', role: 'graphics-symbol', 'aria-label': `${r.label}: ${fmt(r.value)}` });
+      const show = (ev) => { bar.classList.add('is-hover'); showTip(ev, r.tipRows || [{ value: fmt(r.value), label: r.label, color: r.color }]); };
+      const hide = () => { bar.classList.remove('is-hover'); hideTip(); };
+      hit.addEventListener('pointermove', show); hit.addEventListener('pointerleave', hide);
+      hit.addEventListener('focus', show); hit.addEventListener('blur', hide);
+      s.append(hit);
+    });
+    container.append(s);
+  }
+
+  function legend(items) {
+    return el('div', { class: 'legend' }, items.map((it) => el('span', {}, [el('span', { class: 'key', style: `background:${it.color}` }), it.label])));
+  }
+  function table(headers, rows, opts = {}) {
+    const t = el('table', { class: 'datatable' });
+    t.append(el('thead', {}, el('tr', {}, headers.map((h) => el('th', { class: h.num ? 'num' : null, text: h.label })))));
+    t.append(el('tbody', {}, rows.map((r) => el('tr', {}, r.map((c, i) => el('td', { class: headers[i].num ? 'num' : null, text: c }))))));
+    if (opts.caption) t.prepend(el('caption', { class: 'hint', text: opts.caption }));
+    return t;
+  }
+  function tile(label, value, delta, cls) {
+    return el('div', { class: `tile${cls ? ' ' + cls : ''}` }, [
+      el('div', { class: 'label', text: label }),
+      el('div', { class: 'value', text: value }),
+      delta ? el('div', { class: 'delta', text: delta }) : null,
+    ]);
+  }
+
+  // ---------- list ----------
+  const pool = () => (state.program === 'D' ? PD.drugs : PB.drugs);
+  const rank = (d, q) => ((d.b || '').toLowerCase().startsWith(q) ? 2 : (d.g || '').toLowerCase().startsWith(q) ? 1 : 0);
+  function sortRows(rows) {
+    const cmp = {
+      spend: (a, b) => (latest(b, 'spend') || 0) - (latest(a, 'spend') || 0),
+      benes: (a, b) => (latest(b, 'benes') || 0) - (latest(a, 'benes') || 0),
+      per_bene: (a, b) => (latest(b, 'per_bene') || 0) - (latest(a, 'per_bene') || 0),
+      per_unit: (a, b) => (latest(b, 'per_unit') || 0) - (latest(a, 'per_unit') || 0),
+      growth: (a, b) => (b.chg ?? -Infinity) - (a.chg ?? -Infinity),
+      name: (a, b) => (a.b || '').localeCompare(b.b || ''),
+    }[state.sort];
+    return rows.slice().sort(cmp);
+  }
+  function filtered() {
+    const q = state.q.trim().toLowerCase();
+    let rows = pool();
+    if (state.program === 'D' && state.filter !== 'all') {
+      rows = rows.filter((d) => d.neg && String(NEG_BY_KEY[d.neg].cohort) === state.filter);
+    }
+    if (q) {
+      rows = rows.filter((d) =>
+        (d.b || '').toLowerCase().includes(q) || (d.g || '').toLowerCase().includes(q) ||
+        (d.desc || '').toLowerCase().includes(q) || (d.hcpcs || '').toLowerCase() === q ||
+        (d.neg && NEG_BY_KEY[d.neg].name.toLowerCase().includes(q))
+      );
+      return rows.slice().sort((a, b) => rank(b, q) - rank(a, q) || (latest(b, 'spend') || 0) - (latest(a, 'spend') || 0));
+    }
+    return sortRows(rows);
+  }
+  function listItem(d) {
+    const neg = d.neg ? NEG_BY_KEY[d.neg] : null;
+    const sortVal = state.sort === 'benes' ? fmtCount(latest(d, 'benes')) : state.sort === 'per_bene' ? fmtPrice(latest(d, 'per_bene'))
+      : state.sort === 'per_unit' ? fmtPrice(latest(d, 'per_unit')) : state.sort === 'growth' ? fmtSigned(d.chg) : fmtMoney(latest(d, 'spend'));
+    const sortSub = state.sort === 'benes' ? `${LATEST} beneficiaries` : state.sort === 'per_bene' ? 'per beneficiary' : state.sort === 'per_unit' ? 'per dosage unit'
+      : state.sort === 'growth' ? `per unit, ${PREV}–${LATEST}` : `${LATEST} spending`;
+    const li = el('li', { class: `item${d.id === state.selected ? ' is-selected' : ''}`, role: 'button', tabindex: '0', 'data-id': d.id }, [
+      el('div', { class: 'item-name' }, [el('span', { text: d.b }), neg ? el('span', { class: `tag${neg.cohort === 2027 ? ' c2027' : ''}`, text: `Negotiated ${neg.cohort}` }) : null]),
+      el('div', { class: 'item-sub', text: d.hcpcs ? `${d.hcpcs} · ${d.desc}` : d.g }),
+      el('div', { class: 'item-val' }, [sortVal, el('small', { text: sortSub })]),
+    ]);
+    const go = () => select(d.id);
+    li.addEventListener('click', go);
+    li.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } });
+    return li;
+  }
+  function renderList() {
+    const rows = filtered();
+    const list = $('#list');
+    list.replaceChildren(...rows.slice(0, state.shown).map(listItem));
+    const what = state.program === 'D' ? 'Part D brand' : 'Part B HCPCS';
+    const q = state.q.trim();
+    $('#listMeta').textContent = q
+      ? `${rows.length.toLocaleString()} ${what} ${rows.length === 1 ? 'row matches' : 'rows match'} “${q}”`
+      : `${rows.length.toLocaleString()} ${what} rows · sorted by ${SORT_LABEL[state.sort]}`;
+    $('#more').hidden = rows.length <= state.shown;
+    $('#more').textContent = `Show more (${Math.min(rows.length - state.shown, 100).toLocaleString()} of ${(rows.length - state.shown).toLocaleString()} remaining)`;
+    if (!state.selected || !BY_ID.has(state.selected)) { if (rows[0]) select(rows[0].id, { keepList: true }); }
+  }
+  function select(id, { keepList = false } = {}) {
+    state.selected = id;
+    writeHash();
+    $$('#list .item').forEach((li) => li.classList.toggle('is-selected', li.dataset.id === id));
+    if (!keepList) { const li = $(`#list .item[data-id="${CSS.escape(id)}"]`); if (li) li.scrollIntoView({ block: 'nearest' }); }
+    renderDetail();
+  }
+
+  // ---------- detail ----------
+  function renderDetail() {
+    const box = $('#detail');
+    box.replaceChildren();
+    const d = BY_ID.get(state.selected);
+    if (!d) { box.append(el('div', { class: 'empty', text: 'Pick a drug from the list to see its numbers.' })); return; }
+    const isD = d.id.startsWith('d:');
+    const neg = d.neg ? NEG_BY_KEY[d.neg] : null;
+
+    // Header card
+    const tags = [el('span', { class: 'tag neutral', text: isD ? 'Medicare Part D' : 'Medicare Part B' })];
+    if (neg) tags.push(el('span', { class: `tag${neg.cohort === 2027 ? ' c2027' : ''}`, text: `Negotiated price from Jan 1, ${neg.cohort}` }));
+    if (isD && d.nm > 1) tags.push(el('span', { class: 'tag neutral', text: `${d.nm} manufacturers` }));
+    const subParts = isD
+      ? [d.g, d.nm === 1 && d.m[0] ? d.m[0].n : null]
+      : [`HCPCS ${d.hcpcs}`, d.desc, d.g && d.g !== d.b ? d.g : null];
+    const head = el('div', { class: 'card d-head' }, [
+      el('div', { class: 'd-title' }, [el('h2', { text: d.b }), ...tags]),
+      el('div', { class: 'd-sub' }, subParts.filter(Boolean).flatMap((p, i) => (i ? [el('span', { class: 'sep', text: '·' }), p] : [p]))),
+    ]);
+    box.append(head);
+
+    // KPI tiles
+    const tiles = el('div', { class: 'tiles' });
+    for (const mtr of METRICS) {
+      const v = latest(d, mtr.k), p = prev(d, mtr.k);
+      const ch = pctChange(v, p);
+      tiles.append(tile(mtr.tile + (mtr.k.startsWith('per_') ? `, ${LATEST}` : ''), mtr.fmt(v), ch == null ? `no ${PREV} value` : `${fmtSigned(ch)} vs ${PREV}`));
+    }
+    box.append(el('div', { class: 'card' }, [
+      el('div', { class: 'card-head' }, [el('h3', { text: isD ? 'What Medicare Part D paid (gross, before rebates)' : 'What Medicare Part B paid (Medicare payment plus beneficiary share)' })]),
+      tiles,
+    ]));
+
+    // Trend card
+    const trend = el('div', { class: 'card' });
+    const seg = el('div', { class: 'seg', role: 'group', 'aria-label': 'Metric' });
+    for (const mtr of METRICS) {
+      seg.append(el('button', { class: `seg-btn${state.metric === mtr.k ? ' is-active' : ''}`, 'aria-pressed': String(state.metric === mtr.k), text: mtr.label, onclick: () => { state.metric = mtr.k; renderDetail(); } }));
+    }
+    const tableBtn = el('button', { class: 'linkbtn', 'aria-pressed': String(state.trendTable), text: state.trendTable ? 'Hide table' : 'Show table', onclick: () => { state.trendTable = !state.trendTable; renderDetail(); } });
+    trend.append(el('div', { class: 'card-head' }, [el('h3', { text: `Trend, ${YEARS[0]}–${LATEST}` }), el('div', { class: 'controls' }, [seg, tableBtn])]));
+    const mtr = METRIC[state.metric];
+    const values = YEARS.map((y) => val(d, y, mtr.k));
+    const flags = YEARS.map((y) => (mtr.k === 'per_unit' ? val(d, y, 'outlier') === 1 : false));
+    const chartDiv = el('div', { class: 'chart' });
+    trend.append(chartDiv);
+    if (flags.some(Boolean)) trend.append(el('p', { class: 'note', text: '⚑ CMS flags this year’s per-unit average as an outlier.' }));
+    if (state.trendTable) {
+      trend.append(el('div', { class: 'tablewrap' }, table(
+        [{ label: 'Year' }, ...METRICS.map((m2) => ({ label: m2.label, num: true }))],
+        YEARS.map((y) => [y, ...METRICS.map((m2) => m2.fmt(val(d, y, m2.k)))])
+      )));
+    }
+    box.append(trend);
+    requestAnimationFrame(() => columnChart(chartDiv, { labels: YEARS, values, flags, fmt: mtr.fmt, title: mtr.label }));
+
+    // Negotiation card
+    if (neg) box.append(negotiationCard(d, neg));
+
+    // Part B payment basis
+    if (!isD) {
+      const kv = el('dl', { class: 'kv' }, [
+        el('dt', { text: 'Payment basis' }), el('dd', { text: 'Medicare pays 106% of the manufacturer’s average sales price (ASP) for most separately paid Part B drugs; the beneficiary owes 20% coinsurance.' }),
+        el('dt', { text: `Average ${LATEST} ASP-based price per unit` }), el('dd', { text: d.asp != null ? fmtPrice(d.asp) : 'not published' }),
+        el('dt', { text: `Average spending per unit, ${LATEST}` }), el('dd', { text: fmtPrice(latest(d, 'per_unit')) }),
+        el('dt', { text: 'Negotiation status' }), el('dd', { text: 'Part B drugs become eligible for negotiated prices starting with the 2028 price year; none apply yet.' }),
+      ]);
+      box.append(el('div', { class: 'card' }, [el('div', { class: 'card-head' }, [el('h3', { text: 'How Part B sets the price' })]), kv]));
+    }
+
+    // Manufacturers
+    if (isD && d.m.length > 1) {
+      const total = latest(d, 'spend') || 0;
+      box.append(el('div', { class: 'card' }, [
+        el('div', { class: 'card-head' }, [el('h3', { text: `Manufacturers, ${LATEST} spending` })]),
+        el('div', { class: 'tablewrap' }, table(
+          [{ label: 'Manufacturer' }, { label: `${LATEST} spending`, num: true }, { label: 'Share', num: true }],
+          d.m.map((m2) => [m2.n, fmtMoney(m2.s), total ? fmtPct((m2.s || 0) / total) : '—'])
+        )),
+      ]));
+    }
+  }
+
+  function impliedRebate(cohort) {
+    const c = NEG.cohorts[String(cohort)];
+    if (!c || !c.est_net_savings || !c.est_net_savings_pct) return null;
+    const netBefore = c.est_net_savings / c.est_net_savings_pct;
+    return 1 - netBefore / c.gross_spend_total;
+  }
+
+  function negotiationCard(d, neg) {
+    const cohort = NEG.cohorts[String(neg.cohort)];
+    const ratio = neg.mfp_30day / neg.list_30day;
+    const agg = neg.partd_agg[LATEST] || { spend: 0, claims: 0, benes: 0 };
+    const gross = agg.spend;
+    const implied = impliedRebate(neg.cohort);
+    if (state.rebate[neg.key] == null) state.rebate[neg.key] = 0;
+    const r = state.rebate[neg.key];
+    const netBefore = gross * (1 - r);
+    const atMfp = gross * ratio;
+    const savings = netBefore - atMfp;
+    const perBeneGross = agg.benes ? gross / agg.benes : null;
+    const multiBrand = neg.partd_ids.length > 1;
+
+    const card = el('div', { class: 'card stack' });
+    card.append(el('div', { class: 'card-head' }, [
+      el('h3', { text: `Negotiated price · takes effect ${fmtDate(cohort.effective)}` }),
+      el('a', { class: 'linkbtn', href: cohort.source_url, rel: 'noopener', text: 'CMS fact sheet' }),
+    ]));
+    card.append(el('p', { class: 'hint' }, [
+      `${neg.name} was selected in the ${cohort.label.toLowerCase()} of the Medicare Drug Price Negotiation Program (${neg.company}). `,
+      `Prices below are per 30-day supply. The list price is the ${cohort.list_price_year} wholesale acquisition cost; the negotiated price is the maximum fair price CMS published on ${fmtDate(cohort.announced)}.`,
+      neg.conditions?.length ? ` Commonly treated: ${neg.conditions.join('; ').toLowerCase()}.` : '',
+    ]));
+
+    // Price comparison
+    const grid = el('div', { class: 'neg-grid' });
+    const left = el('div', {});
+    left.append(legend([{ color: cssVar('--shade-lo'), label: `List price (WAC), ${cohort.list_price_year}` }, { color: cssVar('--shade-hi'), label: `Negotiated price (MFP), ${neg.cohort}` }]));
+    const priceChart = el('div', { class: 'chart' });
+    left.append(priceChart);
+    grid.append(left);
+    grid.append(el('div', { class: 'tiles' }, [
+      tile('Below list price', fmtPct(1 - ratio), `${fmtPrice(neg.list_30day)} → ${fmtPrice(neg.mfp_30day)} per 30 days`, 'hero accent'),
+      tile('A year of therapy at list price', fmtPrice(neg.list_30day * 12), '12 × 30-day supply'),
+      tile('A year at the negotiated price', fmtPrice(neg.mfp_30day * 12), '12 × 30-day supply'),
+      tile(`Medicare gross spending per beneficiary, ${LATEST}`, fmtPrice(perBeneGross), multiBrand ? `all ${neg.partd_ids.length} ${neg.name} rows combined` : 'from the Part D file'),
+    ]));
+    card.append(grid);
+    requestAnimationFrame(() => hbarChart(priceChart, {
+      fmt: fmtPrice, rowH: 34, labelWidth: 150,
+      rows: [
+        { label: `List, ${cohort.list_price_year}`, value: neg.list_30day, color: cssVar('--shade-lo'), tipRows: [{ value: fmtPrice(neg.list_30day), label: `list price per 30-day supply, ${cohort.list_price_year}`, color: cssVar('--shade-lo') }] },
+        { label: `Negotiated, ${neg.cohort}`, value: neg.mfp_30day, color: cssVar('--shade-hi'), tipRows: [{ value: fmtPrice(neg.mfp_30day), label: `negotiated price per 30-day supply, effective ${neg.cohort}`, color: cssVar('--shade-hi') }, { value: fmtPct(1 - ratio), label: 'below list' }] },
+      ],
+    }));
+
+    // What it changes for Medicare
+    card.append(el('h4', { text: `What it would change for Medicare, applied to ${LATEST} spending` }));
+    const slider = el('input', { type: 'range', min: '0', max: '80', step: '1', value: String(Math.round(r * 100)), 'aria-label': 'Assumed pre-negotiation rebate, percent' });
+    const out = el('output', { text: fmtPct(r) });
+    slider.addEventListener('input', () => { out.textContent = `${slider.value}%`; });
+    slider.addEventListener('change', () => { state.rebate[neg.key] = Number(slider.value) / 100; renderDetail(); });
+    const chips = el('div', { class: 'chips' }, [
+      el('button', { class: `chip${r === 0 ? ' is-active' : ''}`, text: 'No rebates (gross terms)', onclick: () => { state.rebate[neg.key] = 0; renderDetail(); } }),
+      implied != null ? el('button', { class: `chip${Math.abs(r - Math.round(implied * 100) / 100) < 0.005 ? ' is-active' : ''}`, text: `CMS-implied average for this cycle (${fmtPct(implied)})`, onclick: () => { state.rebate[neg.key] = Math.round(implied * 100) / 100; renderDetail(); } }) : null,
+    ]);
+    card.append(el('div', { class: 'slider-row' }, [el('span', { class: 'hint', text: 'Assumed rebate Medicare already gets on this drug' }), slider, out, chips]));
+
+    const savingsTiles = el('div', { class: 'tiles' }, [
+      tile(`Gross Part D spending, ${LATEST}`, fmtMoney(gross), multiBrand ? `${neg.partd_ids.length} brand rows combined` : 'before rebates'),
+      tile(`Net of a ${fmtPct(r)} rebate`, fmtMoney(netBefore), r === 0 ? 'same as gross' : 'what Medicare and plans effectively pay today'),
+      tile('At the negotiated price', fmtMoney(atMfp), `gross × ${fmtPct(ratio)} (negotiated ÷ list)`),
+      tile(savings >= 0 ? 'Estimated saving' : 'Estimated shortfall', fmtMoney(Math.abs(savings)), netBefore ? `${fmtPct(Math.abs(savings) / netBefore)} of the net figure` : '', savings >= 0 ? 'accent' : null),
+    ]);
+    card.append(savingsTiles);
+    if (savings < 0) {
+      card.append(el('div', { class: 'warn', text: `At a ${fmtPct(r)} rebate the price Medicare already pays would be below the negotiated price, so this simple model shows no saving. CMS’s aggregate estimate implies rebates vary a lot across the cycle: high for drugs with in-class competition, low for many cancer drugs.` }));
+    }
+    card.append(el('p', { class: 'note' }, [
+      el('strong', { text: 'How this is computed. ' }),
+      `Gross spending is scaled by the negotiated-to-list ratio (${fmtPct(ratio)}) to estimate what the same utilization would cost at the negotiated price. The rebate slider removes an assumed share of gross spending to approximate today’s net cost. `,
+      implied != null ? `CMS’s own estimate for this cycle (${fmtMoney(cohort.est_net_savings)} saved, ${fmtPct(cohort.est_net_savings_pct)} of net spending in ${cohort.spend_year}) implies rebates averaging about ${fmtPct(implied)} across its ${NEG.drugs.filter((x) => x.cohort === neg.cohort).length} drugs.` : '',
+    ]));
+
+    // CMS figures
+    const kv = el('dl', { class: 'kv' }, [
+      el('dt', { text: `Part D gross spending, ${cohort.spend_year} (CMS)` }), el('dd', { text: fmtMoney(neg.gross_spend) }),
+      el('dt', { text: `Part D enrollees who used it, ${cohort.spend_year} (CMS)` }), el('dd', { text: fmtCount(neg.enrollees) }),
+      el('dt', { text: `Whole cycle: gross spending, ${cohort.spend_year}` }), el('dd', { text: `${fmtMoney(cohort.gross_spend_total)} across ${NEG.drugs.filter((x) => x.cohort === neg.cohort).length} drugs, about ${fmtPct(cohort.share_of_partd_gross)} of Part D` }),
+      el('dt', { text: 'Whole cycle: CMS estimated net saving' }), el('dd', { text: `${fmtMoney(cohort.est_net_savings)} (${fmtPct(cohort.est_net_savings_pct)}) had the prices applied in ${cohort.spend_year}` }),
+      el('dt', { text: `Whole cycle: beneficiary out-of-pocket saving, ${cohort.projected_oop_savings_year}` }), el('dd', { text: `${fmtMoney(cohort.projected_oop_savings)} projected by CMS` }),
+    ]);
+    card.append(el('div', {}, [el('h4', { text: 'CMS’s published figures' }), kv]));
+
+    if (neg.ndc_examples?.length) {
+      card.append(el('div', {}, [
+        el('h4', { text: 'Example negotiated prices per package (CMS)' }),
+        el('div', { class: 'tablewrap' }, table([{ label: 'NDC' }, { label: 'Package' }, { label: 'MFP per package', num: true }], neg.ndc_examples.map((n) => [n.ndc, n.package, fmtPrice(n.mfp)]))),
+      ]));
+    }
+
+    if (multiBrand) {
+      const chipsRow = el('div', { class: 'chips' }, neg.partd_ids.map((id) => {
+        const row = BY_ID.get(id);
+        return el('button', { class: `chip${id === d.id ? ' is-active' : ''}`, text: `${row.b} · ${fmtMoney(latest(row, 'spend'))}`, onclick: () => { state.program = 'D'; syncProgramButtons(); renderList(); select(id); } });
+      }));
+      card.append(el('div', {}, [el('h4', { text: `Brand rows covered by this negotiated price (${LATEST} spending)` }), chipsRow]));
+    }
+    return card;
+  }
+
+  // ---------- overview ----------
+  function renderOverview() {
+    const box = $('#cohorts');
+    box.replaceChildren();
+    const totalLatest = META.partd.totals[LATEST]?.spend || 0;
+    for (const [c, info] of Object.entries(NEG.cohorts)) {
+      const drugs = NEG.drugs.filter((d) => String(d.cohort) === c);
+      const wsum = drugs.reduce((a, d) => a + d.gross_spend, 0);
+      const wavg = 1 - drugs.reduce((a, d) => a + d.gross_spend * (d.mfp_30day / d.list_30day), 0) / wsum;
+      const latestSpend = drugs.reduce((a, d) => a + (d.partd_agg[LATEST]?.spend || 0), 0);
+      const implied = impliedRebate(c);
+      box.append(el('div', { class: 'card stack' }, [
+        el('div', { class: 'card-head' }, [
+          el('h3', { text: `${c}: ${info.label}` }),
+          el('span', { class: `tag${c === '2027' ? ' c2027' : ''}`, text: `${drugs.length} drugs · in effect ${fmtDate(info.effective)}` }),
+        ]),
+        el('div', { class: 'tiles' }, [
+          tile(`Part D gross spending on these drugs, ${info.spend_year}`, fmtMoney(info.gross_spend_total), `about ${fmtPct(info.share_of_partd_gross)} of all Part D gross spending`, 'hero'),
+          tile(`Enrollees who used them, ${info.spend_year}`, fmtCount(info.enrollees_used), `of ${fmtCount(info.partd_enrollees_total)} with Part D`),
+          tile('Spending-weighted discount from list', fmtPct(wavg), `range ${fmtPct(Math.min(...drugs.map((d) => d.discount)))}–${fmtPct(Math.max(...drugs.map((d) => d.discount)))}`),
+          tile(`CMS estimated net saving, ${info.spend_year} basis`, fmtMoney(info.est_net_savings), `${fmtPct(info.est_net_savings_pct)} of net spending, after existing rebates`, 'accent'),
+          tile(`Beneficiary out-of-pocket saving, ${info.projected_oop_savings_year}`, fmtMoney(info.projected_oop_savings), 'CMS projection'),
+          tile(`Share of ${LATEST} Part D gross spending`, totalLatest ? fmtPct(latestSpend / totalLatest) : '—', `${fmtMoney(latestSpend)} of ${fmtMoney(totalLatest)} in this dataset`),
+          implied != null ? tile('Implied average existing rebate', fmtPct(implied), 'derived from CMS’s net-saving estimate; varies widely by drug') : null,
+        ]),
+        el('p', { class: 'note', text: info.est_net_savings_note }),
+        el('p', { class: 'sources' }, [el('a', { href: info.source_url, rel: 'noopener', text: info.source_title })]),
+      ]));
+    }
+
+    // Discount chart
+    const s1 = cssVar('--s1'), s2 = cssVar('--s2');
+    $('#discLegend').replaceChildren(legend([{ color: s1, label: '2026, first cycle' }, { color: s2, label: '2027, second cycle' }]));
+    const sorted = NEG.drugs.slice().sort((a, b) => b.discount - a.discount);
+    const disc = $('#discChart');
+    requestAnimationFrame(() => hbarChart(disc, {
+      fmt: (v) => fmtPct(v), rowH: 26,
+      rows: sorted.map((d) => ({
+        label: d.name, value: 1 - d.mfp_30day / d.list_30day, color: d.cohort === 2027 ? s2 : s1,
+        tipRows: [
+          { value: fmtPct(1 - d.mfp_30day / d.list_30day), label: `${d.name}, below list`, color: d.cohort === 2027 ? s2 : s1 },
+          { value: fmtPrice(d.list_30day), label: `list price per 30 days, ${NEG.cohorts[d.cohort].list_price_year}` },
+          { value: fmtPrice(d.mfp_30day), label: `negotiated price per 30 days, ${d.cohort}` },
+        ],
+      })),
+    }));
+    const dt = $('#discTable');
+    dt.hidden = !state.discTable;
+    $('#discTableBtn').textContent = state.discTable ? 'Hide table' : 'Show table';
+    $('#discTableBtn').setAttribute('aria-pressed', String(state.discTable));
+    dt.replaceChildren(table(
+      [{ label: 'Drug' }, { label: 'Cycle' }, { label: 'List / 30 days', num: true }, { label: 'Negotiated / 30 days', num: true }, { label: 'Below list', num: true }],
+      sorted.map((d) => [d.name, String(d.cohort), fmtPrice(d.list_30day), fmtPrice(d.mfp_30day), fmtPct(1 - d.mfp_30day / d.list_30day)])
+    ));
+
+    // Full table
+    renderNegTable();
+  }
+
+  const NEG_COLS = [
+    { key: 'name', label: 'Drug', get: (d) => d.name },
+    { key: 'cohort', label: 'Cycle', get: (d) => d.cohort, fmt: String },
+    { key: 'company', label: 'Company', get: (d) => d.company },
+    { key: 'conditions', label: 'Commonly treated', get: (d) => d.conditions.join('; '), sortable: false },
+    { key: 'list_30day', label: 'List / 30 days', num: true, get: (d) => d.list_30day, fmt: fmtPrice },
+    { key: 'mfp_30day', label: 'Negotiated / 30 days', num: true, get: (d) => d.mfp_30day, fmt: fmtPrice },
+    { key: 'discount', label: 'Below list', num: true, get: (d) => 1 - d.mfp_30day / d.list_30day, fmt: (v) => fmtPct(v) },
+    { key: 'gross_spend', label: 'Part D gross spending (CMS year)', num: true, get: (d) => d.gross_spend, fmt: fmtMoney },
+    { key: 'enrollees', label: 'Enrollees (CMS year)', num: true, get: (d) => d.enrollees, fmt: fmtCount },
+    { key: 'latest', label: `${LATEST} gross spending (this dataset)`, num: true, get: (d) => d.partd_agg[LATEST]?.spend ?? null, fmt: fmtMoney },
+  ];
+  function renderNegTable() {
+    const t = $('#negTable');
+    t.replaceChildren();
+    const { key, dir } = state.ovSort;
+    const col = NEG_COLS.find((c) => c.key === key);
+    const rows = NEG.drugs.slice().sort((a, b) => {
+      const va = col.get(a), vb = col.get(b);
+      if (typeof va === 'string') return dir * va.localeCompare(vb);
+      return dir * ((va ?? -Infinity) - (vb ?? -Infinity));
+    });
+    t.append(el('thead', {}, el('tr', {}, NEG_COLS.map((c) => el('th', {
+      class: `${c.num ? 'num' : ''}${c.key === key ? ' sorted' : ''}${c.key === key && dir === 1 ? ' asc' : ''}`,
+      text: c.label, scope: 'col',
+      onclick: c.sortable === false ? null : () => { state.ovSort = c.key === key ? { key, dir: -dir } : { key: c.key, dir: c.num ? -1 : 1 }; renderNegTable(); },
+    })))));
+    t.append(el('tbody', {}, rows.map((d) => {
+      const tr = el('tr', { class: 'clickable', tabindex: '0' }, NEG_COLS.map((c) => el('td', { class: c.num ? 'num' : null, text: (c.fmt || String)(c.get(d)) })));
+      const open = () => {
+        const top = d.partd_ids.map((id) => BY_ID.get(id)).sort((a, b) => (latest(b, 'spend') || 0) - (latest(a, 'spend') || 0))[0];
+        if (!top) return;
+        state.program = 'D'; state.filter = 'all'; state.q = ''; $('#q').value = '';
+        syncProgramButtons(); syncFilterButtons();
+        setView('explore'); renderList(); select(top.id);
+      };
+      tr.addEventListener('click', open);
+      tr.addEventListener('keydown', (e) => { if (e.key === 'Enter') open(); });
+      return tr;
+    })));
+  }
+
+  // ---------- views + controls ----------
+  function setView(v) {
+    state.view = v;
+    $$('.tab').forEach((t) => { const on = t.dataset.view === v; t.classList.toggle('is-active', on); t.setAttribute('aria-selected', String(on)); });
+    $('#view-explore').hidden = v !== 'explore';
+    $('#view-overview').hidden = v !== 'overview';
+    writeHash();
+    if (v === 'overview') renderOverview();
+    else requestAnimationFrame(renderDetail); // re-measure chart widths after unhide
+  }
+  function syncProgramButtons() {
+    $$('[data-program]').forEach((b) => { const on = b.dataset.program === state.program; b.classList.toggle('is-active', on); b.setAttribute('aria-pressed', String(on)); });
+    $$('#negFilter .seg-btn').forEach((b) => { b.disabled = state.program === 'B' && b.dataset.filter !== 'all'; });
+  }
+  function syncFilterButtons() {
+    $$('[data-filter]').forEach((b) => { const on = b.dataset.filter === state.filter; b.classList.toggle('is-active', on); b.setAttribute('aria-pressed', String(on)); });
+  }
+
+  $$('.tab').forEach((t) => t.addEventListener('click', () => setView(t.dataset.view)));
+  $$('[data-program]').forEach((b) => b.addEventListener('click', () => {
+    state.program = b.dataset.program; state.shown = 60;
+    if (state.program === 'B') { state.filter = 'all'; syncFilterButtons(); }
+    const cur = BY_ID.get(state.selected);
+    if (!cur || (state.program === 'B') !== cur.id.startsWith('b:')) state.selected = null;
+    syncProgramButtons(); renderList();
+  }));
+  $$('[data-filter]').forEach((b) => b.addEventListener('click', () => {
+    state.filter = b.dataset.filter; state.shown = 60; syncFilterButtons();
+    const cur = BY_ID.get(state.selected);
+    if (state.filter !== 'all' && !(cur && cur.neg && String(NEG_BY_KEY[cur.neg].cohort) === state.filter)) state.selected = null;
+    renderList();
+  }));
+  let qTimer;
+  $('#q').addEventListener('input', (e) => { clearTimeout(qTimer); qTimer = setTimeout(() => { state.q = e.target.value; state.shown = 60; renderList(); }, 120); });
+  $('#sort').addEventListener('change', (e) => { state.sort = e.target.value; state.shown = 60; renderList(); });
+  $('#more').addEventListener('click', () => { state.shown += 100; renderList(); });
+  $('#discTableBtn').addEventListener('click', () => { state.discTable = !state.discTable; renderOverview(); });
+  let rTimer;
+  window.addEventListener('resize', () => { clearTimeout(rTimer); rTimer = setTimeout(() => { if (state.view === 'overview') renderOverview(); else renderDetail(); }, 150); });
+  window.addEventListener('hashchange', () => { readHash(); syncProgramButtons(); setView(state.view); renderList(); if (state.selected) select(state.selected); });
+
+  // ---------- boot ----------
+  readHash();
+  syncProgramButtons();
+  syncFilterButtons();
+  renderList();
+  if (state.selected) select(state.selected);
+  setView(state.view);
+})();

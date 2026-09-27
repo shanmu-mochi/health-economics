@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Medicare Drug Price Explorer</title>
+<meta name="description" content="Pick a drug and see what Medicare pays, what the list price is, and how the 2026 negotiated prices change it. Built on public CMS data.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect x=%274%27 y=%2716%27 width=%276%27 height=%2712%27 rx=%272%27 fill=%27%232a78d6%27/%3E%3Crect x=%2713%27 y=%2710%27 width=%276%27 height=%2718%27 rx=%272%27 fill=%27%232a78d6%27/%3E%3Crect x=%2722%27 y=%274%27 width=%276%27 height=%2724%27 rx=%272%27 fill=%27%232a78d6%27/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="brand">
+      <h1>Medicare Drug Price Explorer</h1>
+      <p class="sub">Pick a drug and see what Medicare pays, what the list price is, and how the negotiated prices that took effect in 2026 change it. Public CMS data, <span id="yearRange">2020–2024</span>.</p>
+    </div>
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button class="tab is-active" role="tab" data-view="explore" aria-selected="true">Explore a drug</button>
+      <button class="tab" role="tab" data-view="overview" aria-selected="false">Negotiated prices</button>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+  <section id="view-explore" class="view">
+    <div class="filters" role="search">
+      <input id="q" type="search" placeholder="Search a brand or generic name…" aria-label="Search drugs" autocomplete="off" spellcheck="false">
+      <div class="seg" role="group" aria-label="Medicare program">
+        <button class="seg-btn is-active" data-program="D" aria-pressed="true">Part D</button>
+        <button class="seg-btn" data-program="B" aria-pressed="false">Part B</button>
+      </div>
+      <div class="seg" role="group" aria-label="Negotiation filter" id="negFilter">
+        <button class="seg-btn is-active" data-filter="all" aria-pressed="true">All drugs</button>
+        <button class="seg-btn" data-filter="2026" aria-pressed="false">Negotiated · 2026</button>
+        <button class="seg-btn" data-filter="2027" aria-pressed="false">Negotiated · 2027</button>
+      </div>
+      <label class="sort">Sort by
+        <select id="sort" aria-label="Sort drugs">
+          <option value="spend">Medicare spending</option>
+          <option value="benes">Beneficiaries</option>
+          <option value="per_bene">Spending per beneficiary</option>
+          <option value="per_unit">Spending per dosage unit</option>
+          <option value="growth">Per-unit change, last year</option>
+          <option value="name">Name</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="cols">
+      <aside class="list-col" aria-label="Drug list">
+        <div id="listMeta" class="list-meta"></div>
+        <ol id="list" class="list"></ol>
+        <button id="more" class="more" hidden>Show more</button>
+      </aside>
+      <article id="detail" class="detail" aria-live="polite"></article>
+    </div>
+  </section>
+
+  <section id="view-overview" class="view" hidden>
+    <div id="cohorts" class="cohorts"></div>
+    <div class="card">
+      <div class="card-head">
+        <h3>Discount from list price, all negotiated drugs</h3>
+        <button class="linkbtn" id="discTableBtn" aria-pressed="false">Show table</button>
+      </div>
+      <p class="hint">Negotiated price for a 30-day supply compared with the wholesale acquisition cost CMS used as the list price. Hover a bar for the two prices.</p>
+      <div class="legend" id="discLegend"></div>
+      <div id="discChart" class="chart"></div>
+      <div id="discTable" class="tablewrap" hidden></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Every negotiated drug</h3><span class="hint">Click a column to sort. Click a row to open the drug.</span></div>
+      <div class="tablewrap"><table id="negTable" class="datatable wide"></table></div>
+    </div>
+  </section>
+</main>
+
+<footer class="wrap foot">
+  <details>
+    <summary>About the numbers</summary>
+    <ul>
+      <li><strong>Part D spending</strong> is the gross drug cost on the claim: what Medicare, the plan and the beneficiary paid together, before any manufacturer rebate or other price concession. CMS is barred from publishing rebates, so these figures overstate Medicare's net cost, often by a wide margin for drugs with heavy rebates.</li>
+      <li><strong>Part B spending</strong> is the full value of the product at the HCPCS-code level, including the Medicare payment and the beneficiary's share. Medicare pays 106% of the manufacturer's average sales price (ASP) for most separately paid Part B drugs.</li>
+      <li><strong>List price</strong> is the wholesale acquisition cost (WAC) for a 30-day supply, as CMS published it in the negotiation fact sheets (2023 prices for the first cycle, 2024 for the second).</li>
+      <li><strong>Negotiated price</strong> is the maximum fair price (MFP) for a 30-day supply. The binding MFP is set per package (NDC); the 30-day figure is CMS's summary.</li>
+      <li><strong>The savings calculator</strong> scales a drug's gross spending by the ratio of negotiated price to list price and subtracts an assumed rebate. It ignores utilization changes, the 2025 Part D benefit redesign and the manufacturer discount program. Treat it as an illustration, not a forecast.</li>
+      <li><strong>Outlier flag.</strong> CMS marks a year's per-dosage-unit average when reported dosage units make it unreliable. Flagged values are marked in the trend chart.</li>
+    </ul>
+  </details>
+  <p class="sources">Sources: <a id="srcPartD" href="https://data.cms.gov/summary-statistics-on-use-and-payments/medicare-medicaid-spending-by-drug/medicare-part-d-spending-by-drug" rel="noopener">CMS Medicare Part D Spending by Drug</a> · <a id="srcPartB" href="https://data.cms.gov/summary-statistics-on-use-and-payments/medicare-medicaid-spending-by-drug/medicare-part-b-spending-by-drug" rel="noopener">CMS Medicare Part B Spending by Drug</a> · <a href="https://www.cms.gov/files/document/fact-sheet-negotiated-prices-initial-price-applicability-year-2026.pdf" rel="noopener">CMS fact sheet, negotiated prices for 2026</a> · <a href="https://www.cms.gov/files/document/fact-sheet-negotiated-prices-ipay-2027.pdf" rel="noopener">CMS fact sheet, negotiated prices for 2027</a>. <span id="generated"></span></p>
+</footer>
+
+<div id="tip" class="tip" role="tooltip" hidden></div>
+<noscript><p class="wrap">This explorer needs JavaScript to load the CMS data files.</p></noscript>
+<script src="app.js"></script>
+</body>
+</html>

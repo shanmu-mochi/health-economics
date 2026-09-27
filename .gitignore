@@ -1,0 +1,6 @@
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc
+# raw CMS downloads are large and reproducible with build_data.py --refresh
+drug-price-explorer/raw/*.csv
