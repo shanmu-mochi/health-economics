@@ -13,13 +13,26 @@ Any static file server works. The page fetches `site/data/*.json`, so it has to 
 
 ## What you can do
 
-- **Search** 3,600+ Part D brand rows and ~800 Part B HCPCS rows by brand, generic or code. Sort by spending, beneficiaries, per-beneficiary cost, per-unit cost, or last year's per-unit change.
-- **See what Medicare paid** for 2020–2024: total gross spending, beneficiaries, claims, and spending per claim, per beneficiary and per dosage unit, with year-over-year deltas and a five-year trend chart (with a table view).
-- **Compare list price to the negotiated price** for the 10 drugs whose maximum fair prices took effect in 2026 and the 15 whose prices take effect in 2027: 30-day list price vs negotiated price, the discount, and a year of therapy at each.
-- **Model what changes for Medicare.** A rebate slider lets you move from gross terms (what the CMS file reports) to a net view. CMS's own aggregate savings estimate implies pre-negotiation rebates averaging about 51% across the first cycle and 36% across the second; a chip applies that value.
-- **Negotiated prices view** summarizes both cycles, charts every drug's discount, and gives a sortable table that links back to each drug's page.
+Each drug page leads with **four numbers**, each with a one-line explanation of why it matters:
 
-The URL hash (`#drug=…`, `#view=overview`) makes any view shareable.
+1. **Medicare spent** in the latest year, with its rank among all drugs, its share of program spending, and the change from the prior year.
+2. **People who filled it**, expressed as "about 1 in N" of everyone with Part D.
+3. **Cost per person, per year**, with the monthly equivalent.
+4. **Negotiated price** (percent off list, with the two 30-day prices) for the 25 negotiated drugs, or the **price-per-unit change** for everything else.
+
+A short plain-English summary follows, generated from the data: whether spending moved because of price or because of use, and for negotiated drugs what the new price would do to gross spending and why the real saving is smaller.
+
+Everything else sits in collapsed sections so the page stays readable:
+
+- **Five-year trend** (2020–2024) with a metric switcher, hover and keyboard tooltips, and a table view.
+- **Negotiated price and savings model**: list vs negotiated price, a year of therapy at each, and a four-step estimate of what the price changes for Medicare. A rebate slider moves from gross terms to a net view; a chip applies the rebate CMS's own savings estimate implies (about 51% for the first cycle, 36% for the second).
+- **All figures**: every published metric with its definition, manufacturers, and for Part B the ASP payment basis.
+
+"Expand all details" opens every section and is remembered between visits. A "How to read this page" primer at the top explains gross vs net spending, list price, the negotiated price ceiling, and why percent-off-list overstates savings.
+
+The **Negotiated prices** tab summarizes both cycles in four numbers each (spending on the drugs, average cut from list, CMS's net saving estimate, patient out-of-pocket saving), charts every drug's discount, and gives a sortable table that links back to each drug.
+
+You can **search** 3,600+ Part D brand rows and ~800 Part B HCPCS rows by brand, generic or code, filter to either negotiation cycle, and sort by spending, beneficiaries, per-beneficiary cost, per-unit cost, or last year's per-unit change. The URL hash (`#drug=…`, `#view=overview`) makes any view shareable.
 
 ## Data
 

@@ -117,6 +117,7 @@
   const state = {
     view: 'explore', program: 'D', filter: 'all', q: '', sort: 'spend', selected: null,
     metric: 'spend', shown: 60, trendTable: false, rebate: {}, ovSort: { key: 'gross_spend', dir: -1 }, discTable: false,
+    expandAll: localStorage.getItem('dpe.expandAll') === '1', primerOpen: localStorage.getItem('dpe.primer') !== '0',
   };
   function readHash() {
     const h = new URLSearchParams(location.hash.slice(1));
@@ -339,86 +340,198 @@
     renderDetail();
   }
 
+  // ---------- headline helpers ----------
+  const PARTD_ENROLLEES = NEG.cohorts['2027']?.partd_enrollees_total || 53e6;
+  const absPct = (v, d = 1) => `${Math.abs(v * 100).toFixed(d)}%`;
+  const ordinal = (n) => { const s = ['th', 'st', 'nd', 'rd'], v = n % 100; return n + (s[(v - 20) % 10] || s[v] || s[0]); };
+  const isPartD = (d) => d.id.startsWith('d:');
+  function rankOf(d) { const rows = isPartD(d) ? PD.drugs : PB.drugs; return { rank: rows.indexOf(d) + 1, total: rows.length }; }
+  function shareOf(d) {
+    const t = META[isPartD(d) ? 'partd' : 'partb'].totals[LATEST]?.spend, v = latest(d, 'spend');
+    return t && v != null ? v / t : null;
+  }
+  const fmtShare = (x) => (x == null ? '' : x >= 0.01 ? fmtPct(x, 1) : x >= 0.001 ? fmtPct(x, 2) : 'under 0.1%');
+  const upDown = (g, from = PREV) => (g == null ? '' : `${g >= 0 ? 'Up' : 'Down'} ${absPct(g)} from ${from}.`);
+  const hl = (label, value, why, cls) => el('div', { class: `hl${cls ? ' ' + cls : ''}` }, [
+    el('div', { class: 'label', text: label }), el('div', { class: 'value', text: value }), el('div', { class: 'why', text: why }),
+  ]);
+
+  function headline(d, neg) {
+    const isD = isPartD(d);
+    const spend = latest(d, 'spend'), benes = latest(d, 'benes'), perBene = latest(d, 'per_bene'), perUnit = latest(d, 'per_unit');
+    const { rank, total } = rankOf(d), share = shareOf(d);
+    const prog = isD ? 'Part D' : 'Part B';
+    const tiles = [];
+    tiles.push(hl(`Medicare spent, ${LATEST}`, fmtMoney(spend), [
+      spend != null ? `${ordinal(rank)} of ${fmtInt(total)} ${prog} drugs${share != null ? `, ${fmtShare(share)} of all ${prog} drug spending` : ''}.` : 'No value published.',
+      upDown(pctChange(spend, prev(d, 'spend'))),
+      isD ? 'Gross, before rebates.' : 'Includes the patient’s 20% share.',
+    ].filter(Boolean).join(' ')));
+    let people;
+    if (benes == null) people = 'No value published.';
+    else if (isD) {
+      const n = Math.round(PARTD_ENROLLEES / benes);
+      people = n <= 2 ? `Most of the ~${fmtCount(PARTD_ENROLLEES)} people with Part D.` : n <= 2000 ? `About 1 in ${fmtInt(n)} of the ~${fmtCount(PARTD_ENROLLEES)} people with Part D.` : `A small group among the ~${fmtCount(PARTD_ENROLLEES)} with Part D.`;
+    } else people = `Beneficiaries with at least one ${LATEST} claim.`;
+    tiles.push(hl(isD ? 'People who filled it' : 'People treated', fmtCount(benes), `${people} ${upDown(pctChange(benes, prev(d, 'benes')))}`.trim()));
+    tiles.push(hl('Cost per person, per year', fmtPrice(perBene), perBene != null
+      ? `About ${fmtPrice(perBene / 12)} a month on average, all payers combined. ${upDown(pctChange(perBene, prev(d, 'per_bene')))}`.trim()
+      : 'No value published.'));
+    if (neg) {
+      const cohort = NEG.cohorts[neg.cohort], ratio = neg.mfp_30day / neg.list_30day;
+      tiles.push(hl(`Negotiated price, from ${neg.cohort}`, `${fmtPct(1 - ratio)} off list`, `${fmtPrice(neg.list_30day)} → ${fmtPrice(neg.mfp_30day)} for a 30-day supply, effective ${fmtDate(cohort.effective)}.`, 'accent'));
+    } else {
+      tiles.push(hl(`Price per dose unit vs ${PREV}`, fmtSigned(d.chg), [
+        perUnit != null ? `${fmtPrice(perUnit)} per unit in ${LATEST}${d.cagr != null ? `, ${fmtSigned(d.cagr)} a year on average since ${YEARS[0]}` : ''}.` : '',
+        isD ? 'Not among the 25 drugs with negotiated prices for 2026 or 2027.' : 'Part B drugs join negotiation from 2028.',
+      ].filter(Boolean).join(' ')));
+    }
+    return el('div', { class: 'hl-grid' }, tiles);
+  }
+
+  function story(d, neg) {
+    const isD = isPartD(d);
+    const out = [];
+    const spend = latest(d, 'spend');
+    const gS = pctChange(spend, prev(d, 'spend')), gB = pctChange(latest(d, 'benes'), prev(d, 'benes')), gU = pctChange(latest(d, 'per_unit'), prev(d, 'per_unit'));
+    if (gS != null && gB != null && gU != null) {
+      let why;
+      if (Math.abs(gU) < 0.02 && Math.abs(gB) >= 0.05) why = `the price per dose unit was flat (${fmtSigned(gU)}) while the number of people using it ${gB > 0 ? 'grew' : 'shrank'} ${absPct(gB)}, so this is a story about use, not price`;
+      else if (Math.abs(gB) < 0.02 && Math.abs(gU) >= 0.05) why = `use was flat while the price per dose unit ${gU > 0 ? 'rose' : 'fell'} ${absPct(gU)}, so this is a story about price, not use`;
+      else if (gB * gU > 0) why = `${gB > 0 ? 'more' : 'fewer'} people (${fmtSigned(gB)}) and a ${gU > 0 ? 'higher' : 'lower'} price per dose unit (${fmtSigned(gU)}) both pushed spending ${gS >= 0 ? 'up' : 'down'}`;
+      else why = `${gB > 0 ? 'more' : 'fewer'} people used it (${fmtSigned(gB)}) while the price per dose unit ${gU > 0 ? 'rose' : 'fell'} (${fmtSigned(gU)}), pulling in opposite directions`;
+      out.push(`Spending ${gS >= 0 ? 'rose' : 'fell'} ${absPct(gS)} in ${LATEST}: ${why}.`);
+    } else if (spend != null && prev(d, 'spend') == null) {
+      out.push(`${LATEST} is the first year with published spending for this row.`);
+    }
+    if (isD && d.nm > 1) out.push(`Sold under this brand name by ${d.nm} manufacturers in ${LATEST}.`);
+    if (latest(d, 'outlier') === 1) out.push(`CMS flags the ${LATEST} per-unit figure as an outlier, so treat unit-price comparisons with care.`);
+    if (neg) {
+      const cohort = NEG.cohorts[neg.cohort], ratio = neg.mfp_30day / neg.list_30day;
+      const agg = neg.partd_agg[LATEST] || { spend: 0 };
+      const n = NEG.drugs.filter((x) => x.cohort === neg.cohort).length;
+      const inEffect = new Date(cohort.effective + 'T00:00:00') <= new Date();
+      const multi = neg.partd_ids.length > 1;
+      out.push(`${neg.name} is one of ${n} drugs whose negotiated Medicare price ${inEffect ? 'took' : 'takes'} effect on ${fmtDate(cohort.effective)}: ${fmtPrice(neg.list_30day)} list → ${fmtPrice(neg.mfp_30day)} for a 30-day supply, ${fmtPct(1 - ratio)} lower.`);
+      out.push(`Applied to ${LATEST} use, that ratio would cut gross spending${multi ? ` on all ${neg.partd_ids.length} ${neg.name} rows` : ''} from ${fmtMoney(agg.spend)} to about ${fmtMoney(agg.spend * ratio)}. The real saving is smaller, because Medicare already gets rebates on this drug; CMS estimates the whole ${cohort.label.toLowerCase()} saves about ${fmtPct(cohort.est_net_savings_pct)} of net spending. Open “Negotiated price and savings model” to try your own rebate assumption.`);
+    } else if (!isD) {
+      out.push(`Part B pays 106% of the manufacturer’s average sales price, so the per-unit figure moves with the manufacturer’s own price cuts or increases.`);
+    }
+    return el('div', { class: 'card story' }, out.map((t) => el('p', { text: t })));
+  }
+
+  /** A collapsible section. `build(body)` runs the first time it opens (charts need a real width). */
+  const openSections = new Set();
+  function section(key, title, hint, build) {
+    const open = state.expandAll || openSections.has(key);
+    const det = el('details', { class: 'card sect', open: open ? '' : null });
+    det.append(el('summary', {}, [el('span', { class: 'sect-title', text: title }), hint ? el('span', { class: 'hint', text: hint }) : null]));
+    const body = el('div', { class: 'sect-body' });
+    det.append(body);
+    let built = false;
+    const ensure = () => { if (!built) { built = true; build(body); } };
+    det.addEventListener('toggle', () => { if (det.open) { openSections.add(key); ensure(); } else openSections.delete(key); });
+    if (open) requestAnimationFrame(ensure);
+    return det;
+  }
+  function primer() {
+    const det = el('details', { class: 'card primer', open: state.primerOpen ? '' : null });
+    det.addEventListener('toggle', () => { state.primerOpen = det.open; localStorage.setItem('dpe.primer', det.open ? '1' : '0'); });
+    det.append(el('summary', {}, [el('span', { class: 'sect-title', text: 'How to read this page' })]));
+    det.append(el('ul', {}, [
+      el('li', {}, [el('strong', { text: 'Spending is gross. ' }), 'It is what Medicare, the plan and the patient paid at the pharmacy, before the confidential rebates manufacturers pay back. Medicare’s real cost is lower, often much lower.']),
+      el('li', {}, [el('strong', { text: 'List price is the sticker price. ' }), 'The wholesale acquisition cost for a 30-day supply. Almost nobody pays it, but rebates and the negotiated cut are both measured against it.']),
+      el('li', {}, [el('strong', { text: 'Negotiated price is a ceiling. ' }), 'The “maximum fair price” Medicare plans pay from January 2026 for the first 10 drugs and January 2027 for the next 15.']),
+      el('li', {}, [el('strong', { text: 'Percent off list overstates the saving. ' }), 'Rebates already filled part of the gap between list and what Medicare pays; the negotiated price cuts from there. That is why a 62% average cut becomes a 22% real saving in CMS’s own estimate.']),
+      el('li', {}, [el('strong', { text: 'A dose unit ' }), 'is one tablet, capsule, millilitre or similar, as CMS counts it. A claim is one fill, often 30 or 90 days.']),
+    ]));
+    return det;
+  }
+
   // ---------- detail ----------
   function renderDetail() {
     const box = $('#detail');
     box.replaceChildren();
     const d = BY_ID.get(state.selected);
     if (!d) { box.append(el('div', { class: 'empty', text: 'Pick a drug from the list to see its numbers.' })); return; }
-    const isD = d.id.startsWith('d:');
+    const isD = isPartD(d);
     const neg = d.neg ? NEG_BY_KEY[d.neg] : null;
 
-    // Header card
+    box.append(primer());
+
+    // Header
     const tags = [el('span', { class: 'tag neutral', text: isD ? 'Medicare Part D' : 'Medicare Part B' })];
     if (neg) tags.push(el('span', { class: `tag${neg.cohort === 2027 ? ' c2027' : ''}`, text: `Negotiated price from Jan 1, ${neg.cohort}` }));
-    if (isD && d.nm > 1) tags.push(el('span', { class: 'tag neutral', text: `${d.nm} manufacturers` }));
-    const subParts = isD
-      ? [d.g, d.nm === 1 && d.m[0] ? d.m[0].n : null]
-      : [`HCPCS ${d.hcpcs}`, d.desc, d.g && d.g !== d.b ? d.g : null];
-    const head = el('div', { class: 'card d-head' }, [
-      el('div', { class: 'd-title' }, [el('h2', { text: d.b }), ...tags]),
+    const subParts = isD ? [d.g, d.nm === 1 && d.m[0] ? d.m[0].n : null] : [`HCPCS ${d.hcpcs}`, d.desc, d.g && d.g !== d.b ? d.g : null];
+    const expandBtn = el('button', { class: 'linkbtn', text: state.expandAll ? 'Collapse details' : 'Expand all details', onclick: () => { state.expandAll = !state.expandAll; localStorage.setItem('dpe.expandAll', state.expandAll ? '1' : '0'); if (!state.expandAll) openSections.clear(); renderDetail(); } });
+    box.append(el('div', { class: 'card d-head' }, [
+      el('div', { class: 'card-head' }, [el('div', { class: 'd-title' }, [el('h2', { text: d.b }), ...tags]), expandBtn]),
       el('div', { class: 'd-sub' }, subParts.filter(Boolean).flatMap((p, i) => (i ? [el('span', { class: 'sep', text: '·' }), p] : [p]))),
-    ]);
-    box.append(head);
-
-    // KPI tiles
-    const tiles = el('div', { class: 'tiles' });
-    for (const mtr of METRICS) {
-      const v = latest(d, mtr.k), p = prev(d, mtr.k);
-      const ch = pctChange(v, p);
-      tiles.append(tile(mtr.tile + (mtr.k.startsWith('per_') ? `, ${LATEST}` : ''), mtr.fmt(v), ch == null ? `no ${PREV} value` : `${fmtSigned(ch)} vs ${PREV}`));
-    }
-    box.append(el('div', { class: 'card' }, [
-      el('div', { class: 'card-head' }, [el('h3', { text: isD ? 'What Medicare Part D paid (gross, before rebates)' : 'What Medicare Part B paid (Medicare payment plus beneficiary share)' })]),
-      tiles,
+      headline(d, neg),
     ]));
 
-    // Trend card
-    const trend = el('div', { class: 'card' });
+    // Plain-English summary
+    box.append(story(d, neg));
+
+    // Sections
+    box.append(section('trend', `Five-year trend, ${YEARS[0]}–${LATEST}`, 'spending, people, claims and unit price by year', (body) => buildTrend(body, d)));
+    if (neg) box.append(section('neg', 'Negotiated price and savings model', 'list vs negotiated price, and what it changes for Medicare', (body) => buildNegotiation(body, d, neg)));
+    box.append(section('more', `All ${LATEST} figures`, isD ? 'every published metric, with manufacturers' : 'every published metric, with the ASP payment basis', (body) => buildMore(body, d)));
+  }
+
+  function buildTrend(body, d) {
+    body.replaceChildren();
     const seg = el('div', { class: 'seg', role: 'group', 'aria-label': 'Metric' });
     for (const mtr of METRICS) {
-      seg.append(el('button', { class: `seg-btn${state.metric === mtr.k ? ' is-active' : ''}`, 'aria-pressed': String(state.metric === mtr.k), text: mtr.label, onclick: () => { state.metric = mtr.k; renderDetail(); } }));
+      seg.append(el('button', { class: `seg-btn${state.metric === mtr.k ? ' is-active' : ''}`, 'aria-pressed': String(state.metric === mtr.k), text: mtr.label, onclick: () => { state.metric = mtr.k; buildTrend(body, d); } }));
     }
-    const tableBtn = el('button', { class: 'linkbtn', 'aria-pressed': String(state.trendTable), text: state.trendTable ? 'Hide table' : 'Show table', onclick: () => { state.trendTable = !state.trendTable; renderDetail(); } });
-    trend.append(el('div', { class: 'card-head' }, [el('h3', { text: `Trend, ${YEARS[0]}–${LATEST}` }), el('div', { class: 'controls' }, [seg, tableBtn])]));
+    const tableBtn = el('button', { class: 'linkbtn', 'aria-pressed': String(state.trendTable), text: state.trendTable ? 'Hide table' : 'Show table', onclick: () => { state.trendTable = !state.trendTable; buildTrend(body, d); } });
+    body.append(el('div', { class: 'controls' }, [seg, tableBtn]));
     const mtr = METRIC[state.metric];
     const values = YEARS.map((y) => val(d, y, mtr.k));
     const flags = YEARS.map((y) => (mtr.k === 'per_unit' ? val(d, y, 'outlier') === 1 : false));
     const chartDiv = el('div', { class: 'chart' });
-    trend.append(chartDiv);
-    if (flags.some(Boolean)) trend.append(el('p', { class: 'note', text: '⚑ CMS flags this year’s per-unit average as an outlier.' }));
+    body.append(chartDiv);
+    body.append(el('p', { class: 'hint', text: {
+      spend: 'Gross drug cost by year. Rising bars with a flat unit price mean growth came from more people or more fills.',
+      benes: 'People with at least one fill in the year.',
+      claims: 'Fills. A 90-day fill counts once, so claims understate months of therapy.',
+      per_claim: 'Average cost of one fill. Moves with both unit price and days per fill.',
+      per_bene: 'Average annual cost per person who used the drug.',
+      per_unit: 'Closest thing to a unit price. ⚑ marks a year CMS considers an outlier.',
+    }[mtr.k] }));
     if (state.trendTable) {
-      trend.append(el('div', { class: 'tablewrap' }, table(
+      body.append(el('div', { class: 'tablewrap' }, table(
         [{ label: 'Year' }, ...METRICS.map((m2) => ({ label: m2.label, num: true }))],
         YEARS.map((y) => [y, ...METRICS.map((m2) => m2.fmt(val(d, y, m2.k)))])
       )));
     }
-    box.append(trend);
     requestAnimationFrame(() => columnChart(chartDiv, { labels: YEARS, values, flags, fmt: mtr.fmt, title: mtr.label }));
+  }
 
-    // Negotiation card
-    if (neg) box.append(negotiationCard(d, neg));
-
-    // Part B payment basis
+  function buildMore(body, d) {
+    const isD = isPartD(d);
+    body.append(el('div', { class: 'tablewrap' }, table(
+      [{ label: 'Metric' }, { label: LATEST, num: true }, { label: PREV, num: true }, { label: 'Change', num: true }, { label: 'What it means' }],
+      METRICS.map((m) => [m.label, m.fmt(latest(d, m.k)), m.fmt(prev(d, m.k)), fmtSigned(pctChange(latest(d, m.k), prev(d, m.k))), {
+        spend: isD ? 'Gross drug cost: Medicare + plan + patient, before rebates' : 'Medicare payment plus the patient’s share',
+        benes: 'People with at least one claim', claims: 'Fills (a 90-day fill counts once)',
+        per_claim: 'Total spending ÷ claims', per_bene: 'Total spending ÷ people', per_unit: isD ? 'Weighted average per tablet, capsule, mL or similar' : 'Average per HCPCS billing unit',
+      }[m.k]])
+    )));
+    if (isD && d.m.length > 1) {
+      const total = latest(d, 'spend') || 0;
+      body.append(el('div', {}, [el('h4', { text: `Manufacturers, ${LATEST} spending` }), el('div', { class: 'tablewrap' }, table(
+        [{ label: 'Manufacturer' }, { label: `${LATEST} spending`, num: true }, { label: 'Share', num: true }],
+        d.m.map((m2) => [m2.n, fmtMoney(m2.s), total ? fmtPct((m2.s || 0) / total) : '—'])
+      ))]));
+    }
     if (!isD) {
-      const kv = el('dl', { class: 'kv' }, [
+      body.append(el('dl', { class: 'kv' }, [
         el('dt', { text: 'Payment basis' }), el('dd', { text: 'Medicare pays 106% of the manufacturer’s average sales price (ASP) for most separately paid Part B drugs; the beneficiary owes 20% coinsurance.' }),
         el('dt', { text: `Average ${LATEST} ASP-based price per unit` }), el('dd', { text: d.asp != null ? fmtPrice(d.asp) : 'not published' }),
         el('dt', { text: `Average spending per unit, ${LATEST}` }), el('dd', { text: fmtPrice(latest(d, 'per_unit')) }),
         el('dt', { text: 'Negotiation status' }), el('dd', { text: 'Part B drugs become eligible for negotiated prices starting with the 2028 price year; none apply yet.' }),
-      ]);
-      box.append(el('div', { class: 'card' }, [el('div', { class: 'card-head' }, [el('h3', { text: 'How Part B sets the price' })]), kv]));
-    }
-
-    // Manufacturers
-    if (isD && d.m.length > 1) {
-      const total = latest(d, 'spend') || 0;
-      box.append(el('div', { class: 'card' }, [
-        el('div', { class: 'card-head' }, [el('h3', { text: `Manufacturers, ${LATEST} spending` })]),
-        el('div', { class: 'tablewrap' }, table(
-          [{ label: 'Manufacturer' }, { label: `${LATEST} spending`, num: true }, { label: 'Share', num: true }],
-          d.m.map((m2) => [m2.n, fmtMoney(m2.s), total ? fmtPct((m2.s || 0) / total) : '—'])
-        )),
       ]));
     }
   }
@@ -430,7 +543,8 @@
     return 1 - netBefore / c.gross_spend_total;
   }
 
-  function negotiationCard(d, neg) {
+  function buildNegotiation(body, d, neg) {
+    body.replaceChildren();
     const cohort = NEG.cohorts[String(neg.cohort)];
     const ratio = neg.mfp_30day / neg.list_30day;
     const agg = neg.partd_agg[LATEST] || { spend: 0, claims: 0, benes: 0 };
@@ -443,16 +557,11 @@
     const savings = netBefore - atMfp;
     const perBeneGross = agg.benes ? gross / agg.benes : null;
     const multiBrand = neg.partd_ids.length > 1;
+    const nDrugs = NEG.drugs.filter((x) => x.cohort === neg.cohort).length;
 
-    const card = el('div', { class: 'card stack' });
-    card.append(el('div', { class: 'card-head' }, [
-      el('h3', { text: `Negotiated price · takes effect ${fmtDate(cohort.effective)}` }),
-      el('a', { class: 'linkbtn', href: cohort.source_url, rel: 'noopener', text: 'CMS fact sheet' }),
-    ]));
-    card.append(el('p', { class: 'hint' }, [
-      `${neg.name} was selected in the ${cohort.label.toLowerCase()} of the Medicare Drug Price Negotiation Program (${neg.company}). `,
-      `Prices below are per 30-day supply. The list price is the ${cohort.list_price_year} wholesale acquisition cost; the negotiated price is the maximum fair price CMS published on ${fmtDate(cohort.announced)}.`,
-      neg.conditions?.length ? ` Commonly treated: ${neg.conditions.join('; ').toLowerCase()}.` : '',
+    body.append(el('p', { class: 'hint' }, [
+      `${neg.name} was selected in the ${cohort.label.toLowerCase()} (${neg.company}). Prices are per 30-day supply: the ${cohort.list_price_year} wholesale acquisition cost versus the maximum fair price CMS published on ${fmtDate(cohort.announced)}. `,
+      el('a', { href: cohort.source_url, rel: 'noopener', text: 'CMS fact sheet' }), '.',
     ]));
 
     // Price comparison
@@ -463,12 +572,11 @@
     left.append(priceChart);
     grid.append(left);
     grid.append(el('div', { class: 'tiles' }, [
-      tile('Below list price', fmtPct(1 - ratio), `${fmtPrice(neg.list_30day)} → ${fmtPrice(neg.mfp_30day)} per 30 days`, 'hero accent'),
       tile('A year of therapy at list price', fmtPrice(neg.list_30day * 12), '12 × 30-day supply'),
       tile('A year at the negotiated price', fmtPrice(neg.mfp_30day * 12), '12 × 30-day supply'),
-      tile(`Medicare gross spending per beneficiary, ${LATEST}`, fmtPrice(perBeneGross), multiBrand ? `all ${neg.partd_ids.length} ${neg.name} rows combined` : 'from the Part D file'),
+      tile(`Medicare gross spending per person, ${LATEST}`, fmtPrice(perBeneGross), multiBrand ? `all ${neg.partd_ids.length} ${neg.name} rows combined` : 'lower than a full year at list because not everyone takes it all year'),
     ]));
-    card.append(grid);
+    body.append(grid);
     requestAnimationFrame(() => hbarChart(priceChart, {
       fmt: fmtPrice, rowH: 34, labelWidth: 150,
       rows: [
@@ -477,59 +585,53 @@
       ],
     }));
 
-    // What it changes for Medicare
-    card.append(el('h4', { text: `What it would change for Medicare, applied to ${LATEST} spending` }));
+    // Savings model
+    body.append(el('h4', { text: `What it would change for Medicare, applied to ${LATEST} spending` }));
+    body.append(el('p', { class: 'hint', text: 'Slide to the rebate you think Medicare already gets. At 0% the saving is an upper bound; the chip applies the average CMS’s own estimate implies for this cycle.' }));
     const slider = el('input', { type: 'range', min: '0', max: '80', step: '1', value: String(Math.round(r * 100)), 'aria-label': 'Assumed pre-negotiation rebate, percent' });
     const out = el('output', { text: fmtPct(r) });
     slider.addEventListener('input', () => { out.textContent = `${slider.value}%`; });
-    slider.addEventListener('change', () => { state.rebate[neg.key] = Number(slider.value) / 100; renderDetail(); });
+    slider.addEventListener('change', () => { state.rebate[neg.key] = Number(slider.value) / 100; buildNegotiation(body, d, neg); });
     const chips = el('div', { class: 'chips' }, [
-      el('button', { class: `chip${r === 0 ? ' is-active' : ''}`, text: 'No rebates (gross terms)', onclick: () => { state.rebate[neg.key] = 0; renderDetail(); } }),
-      implied != null ? el('button', { class: `chip${Math.abs(r - Math.round(implied * 100) / 100) < 0.005 ? ' is-active' : ''}`, text: `CMS-implied average for this cycle (${fmtPct(implied)})`, onclick: () => { state.rebate[neg.key] = Math.round(implied * 100) / 100; renderDetail(); } }) : null,
+      el('button', { class: `chip${r === 0 ? ' is-active' : ''}`, text: 'No rebates (gross terms)', onclick: () => { state.rebate[neg.key] = 0; buildNegotiation(body, d, neg); } }),
+      implied != null ? el('button', { class: `chip${Math.abs(r - Math.round(implied * 100) / 100) < 0.005 ? ' is-active' : ''}`, text: `CMS-implied average for this cycle (${fmtPct(implied)})`, onclick: () => { state.rebate[neg.key] = Math.round(implied * 100) / 100; buildNegotiation(body, d, neg); } }) : null,
     ]);
-    card.append(el('div', { class: 'slider-row' }, [el('span', { class: 'hint', text: 'Assumed rebate Medicare already gets on this drug' }), slider, out, chips]));
-
-    const savingsTiles = el('div', { class: 'tiles' }, [
-      tile(`Gross Part D spending, ${LATEST}`, fmtMoney(gross), multiBrand ? `${neg.partd_ids.length} brand rows combined` : 'before rebates'),
-      tile(`Net of a ${fmtPct(r)} rebate`, fmtMoney(netBefore), r === 0 ? 'same as gross' : 'what Medicare and plans effectively pay today'),
-      tile('At the negotiated price', fmtMoney(atMfp), `gross × ${fmtPct(ratio)} (negotiated ÷ list)`),
-      tile(savings >= 0 ? 'Estimated saving' : 'Estimated shortfall', fmtMoney(Math.abs(savings)), netBefore ? `${fmtPct(Math.abs(savings) / netBefore)} of the net figure` : '', savings >= 0 ? 'accent' : null),
-    ]);
-    card.append(savingsTiles);
+    body.append(el('div', { class: 'slider-row' }, [el('span', { class: 'hint', text: 'Assumed rebate Medicare already gets' }), slider, out, chips]));
+    body.append(el('div', { class: 'tiles' }, [
+      tile(`1. Gross spending, ${LATEST}`, fmtMoney(gross), multiBrand ? `${neg.partd_ids.length} brand rows combined` : 'before rebates'),
+      tile(`2. Net of a ${fmtPct(r)} rebate`, fmtMoney(netBefore), r === 0 ? 'same as gross' : 'roughly what Medicare and plans pay today'),
+      tile('3. At the negotiated price', fmtMoney(atMfp), `gross × ${fmtPct(ratio)} (negotiated ÷ list)`),
+      tile(savings >= 0 ? '4. Estimated saving' : '4. Estimated shortfall', fmtMoney(Math.abs(savings)), netBefore ? `${fmtPct(Math.abs(savings) / netBefore)} of step 2` : '', savings >= 0 ? 'accent' : null),
+    ]));
     if (savings < 0) {
-      card.append(el('div', { class: 'warn', text: `At a ${fmtPct(r)} rebate the price Medicare already pays would be below the negotiated price, so this simple model shows no saving. CMS’s aggregate estimate implies rebates vary a lot across the cycle: high for drugs with in-class competition, low for many cancer drugs.` }));
+      body.append(el('div', { class: 'warn', text: `At a ${fmtPct(r)} rebate the price Medicare already pays would be below the negotiated price, so this simple model shows no saving. Rebates vary a lot across the cycle: high for drugs with in-class competition, low for many cancer drugs.` }));
     }
-    card.append(el('p', { class: 'note' }, [
+    body.append(el('p', { class: 'note' }, [
       el('strong', { text: 'How this is computed. ' }),
-      `Gross spending is scaled by the negotiated-to-list ratio (${fmtPct(ratio)}) to estimate what the same utilization would cost at the negotiated price. The rebate slider removes an assumed share of gross spending to approximate today’s net cost. `,
-      implied != null ? `CMS’s own estimate for this cycle (${fmtMoney(cohort.est_net_savings)} saved, ${fmtPct(cohort.est_net_savings_pct)} of net spending in ${cohort.spend_year}) implies rebates averaging about ${fmtPct(implied)} across its ${NEG.drugs.filter((x) => x.cohort === neg.cohort).length} drugs.` : '',
+      `Gross spending is scaled by the negotiated-to-list ratio (${fmtPct(ratio)}) to estimate what the same use would cost at the negotiated price. The rebate slider removes an assumed share of gross spending to approximate today’s net cost. `,
+      implied != null ? `CMS’s estimate for this cycle (${fmtMoney(cohort.est_net_savings)} saved, ${fmtPct(cohort.est_net_savings_pct)} of net spending in ${cohort.spend_year}) implies rebates averaging about ${fmtPct(implied)} across its ${nDrugs} drugs.` : '',
     ]));
 
     // CMS figures
-    const kv = el('dl', { class: 'kv' }, [
-      el('dt', { text: `Part D gross spending, ${cohort.spend_year} (CMS)` }), el('dd', { text: fmtMoney(neg.gross_spend) }),
-      el('dt', { text: `Part D enrollees who used it, ${cohort.spend_year} (CMS)` }), el('dd', { text: fmtCount(neg.enrollees) }),
-      el('dt', { text: `Whole cycle: gross spending, ${cohort.spend_year}` }), el('dd', { text: `${fmtMoney(cohort.gross_spend_total)} across ${NEG.drugs.filter((x) => x.cohort === neg.cohort).length} drugs, about ${fmtPct(cohort.share_of_partd_gross)} of Part D` }),
-      el('dt', { text: 'Whole cycle: CMS estimated net saving' }), el('dd', { text: `${fmtMoney(cohort.est_net_savings)} (${fmtPct(cohort.est_net_savings_pct)}) had the prices applied in ${cohort.spend_year}` }),
-      el('dt', { text: `Whole cycle: beneficiary out-of-pocket saving, ${cohort.projected_oop_savings_year}` }), el('dd', { text: `${fmtMoney(cohort.projected_oop_savings)} projected by CMS` }),
-    ]);
-    card.append(el('div', {}, [el('h4', { text: 'CMS’s published figures' }), kv]));
-
+    body.append(el('div', {}, [el('h4', { text: 'CMS’s published figures' }), el('dl', { class: 'kv' }, [
+      el('dt', { text: `Part D gross spending, ${cohort.spend_year}` }), el('dd', { text: fmtMoney(neg.gross_spend) }),
+      el('dt', { text: `Part D enrollees who used it, ${cohort.spend_year}` }), el('dd', { text: fmtCount(neg.enrollees) }),
+      el('dt', { text: `Whole cycle: gross spending, ${cohort.spend_year}` }), el('dd', { text: `${fmtMoney(cohort.gross_spend_total)} across ${nDrugs} drugs, about ${fmtPct(cohort.share_of_partd_gross)} of Part D` }),
+      el('dt', { text: 'Whole cycle: estimated net saving' }), el('dd', { text: `${fmtMoney(cohort.est_net_savings)} (${fmtPct(cohort.est_net_savings_pct)}) had the prices applied in ${cohort.spend_year}` }),
+      el('dt', { text: `Whole cycle: patient out-of-pocket saving, ${cohort.projected_oop_savings_year}` }), el('dd', { text: `${fmtMoney(cohort.projected_oop_savings)} projected` }),
+    ])]));
     if (neg.ndc_examples?.length) {
-      card.append(el('div', {}, [
-        el('h4', { text: 'Example negotiated prices per package (CMS)' }),
+      body.append(el('div', {}, [
+        el('h4', { text: 'Example negotiated prices per package' }),
         el('div', { class: 'tablewrap' }, table([{ label: 'NDC' }, { label: 'Package' }, { label: 'MFP per package', num: true }], neg.ndc_examples.map((n) => [n.ndc, n.package, fmtPrice(n.mfp)]))),
       ]));
     }
-
     if (multiBrand) {
-      const chipsRow = el('div', { class: 'chips' }, neg.partd_ids.map((id) => {
+      body.append(el('div', {}, [el('h4', { text: `Brand rows covered by this negotiated price (${LATEST} spending)` }), el('div', { class: 'chips' }, neg.partd_ids.map((id) => {
         const row = BY_ID.get(id);
         return el('button', { class: `chip${id === d.id ? ' is-active' : ''}`, text: `${row.b} · ${fmtMoney(latest(row, 'spend'))}`, onclick: () => { state.program = 'D'; syncProgramButtons(); renderList(); select(id); } });
-      }));
-      card.append(el('div', {}, [el('h4', { text: `Brand rows covered by this negotiated price (${LATEST} spending)` }), chipsRow]));
+      }))]));
     }
-    return card;
   }
 
   // ---------- overview ----------
@@ -543,20 +645,20 @@
       const wavg = 1 - drugs.reduce((a, d) => a + d.gross_spend * (d.mfp_30day / d.list_30day), 0) / wsum;
       const latestSpend = drugs.reduce((a, d) => a + (d.partd_agg[LATEST]?.spend || 0), 0);
       const implied = impliedRebate(c);
+      const inEffect = new Date(info.effective + 'T00:00:00') <= new Date();
+      const discounts = drugs.map((d) => 1 - d.mfp_30day / d.list_30day);
       box.append(el('div', { class: 'card stack' }, [
         el('div', { class: 'card-head' }, [
           el('h3', { text: `${c}: ${info.label}` }),
-          el('span', { class: `tag${c === '2027' ? ' c2027' : ''}`, text: `${drugs.length} drugs · in effect ${fmtDate(info.effective)}` }),
+          el('span', { class: `tag${c === '2027' ? ' c2027' : ''}`, text: `${drugs.length} drugs · ${inEffect ? 'in effect since' : 'from'} ${fmtDate(info.effective)}` }),
         ]),
-        el('div', { class: 'tiles' }, [
-          tile(`Part D gross spending on these drugs, ${info.spend_year}`, fmtMoney(info.gross_spend_total), `about ${fmtPct(info.share_of_partd_gross)} of all Part D gross spending`, 'hero'),
-          tile(`Enrollees who used them, ${info.spend_year}`, fmtCount(info.enrollees_used), `of ${fmtCount(info.partd_enrollees_total)} with Part D`),
-          tile('Spending-weighted discount from list', fmtPct(wavg), `range ${fmtPct(Math.min(...drugs.map((d) => d.discount)))}–${fmtPct(Math.max(...drugs.map((d) => d.discount)))}`),
-          tile(`CMS estimated net saving, ${info.spend_year} basis`, fmtMoney(info.est_net_savings), `${fmtPct(info.est_net_savings_pct)} of net spending, after existing rebates`, 'accent'),
-          tile(`Beneficiary out-of-pocket saving, ${info.projected_oop_savings_year}`, fmtMoney(info.projected_oop_savings), 'CMS projection'),
-          tile(`Share of ${LATEST} Part D gross spending`, totalLatest ? fmtPct(latestSpend / totalLatest) : '—', `${fmtMoney(latestSpend)} of ${fmtMoney(totalLatest)} in this dataset`),
-          implied != null ? tile('Implied average existing rebate', fmtPct(implied), 'derived from CMS’s net-saving estimate; varies widely by drug') : null,
+        el('div', { class: 'hl-grid two' }, [
+          hl(`Medicare spent on them, ${info.spend_year}`, fmtMoney(info.gross_spend_total), `About ${fmtPct(info.share_of_partd_gross)} of all Part D gross spending that year, before rebates.`),
+          hl('Average cut from list price', fmtPct(wavg), `Weighted by spending. Individual cuts range from ${fmtPct(Math.min(...discounts))} to ${fmtPct(Math.max(...discounts))}.`),
+          hl('What CMS says it really saves', fmtMoney(info.est_net_savings), `${fmtPct(info.est_net_savings_pct)} of net spending had the prices applied in ${info.spend_year}. Smaller than the list-price cut because rebates averaging about ${fmtPct(implied)} already existed.`, 'accent'),
+          hl(`Patients save, ${info.projected_oop_savings_year}`, fmtMoney(info.projected_oop_savings), 'CMS projection of lower out-of-pocket costs under the standard benefit.'),
         ]),
+        el('p', { class: 'story-p', text: `${fmtCount(info.enrollees_used)} of the ~${fmtCount(info.partd_enrollees_total)} people with Part D used at least one of these drugs in ${info.spend_year} and paid ${fmtMoney(info.oop_on_selected)} out of pocket. In this dataset the same drugs were ${fmtPct(totalLatest ? latestSpend / totalLatest : null)} of ${LATEST} Part D gross spending (${fmtMoney(latestSpend)} of ${fmtMoney(totalLatest)}).` }),
         el('p', { class: 'note', text: info.est_net_savings_note }),
         el('p', { class: 'sources' }, [el('a', { href: info.source_url, rel: 'noopener', text: info.source_title })]),
       ]));
@@ -586,8 +688,6 @@
       [{ label: 'Drug' }, { label: 'Cycle' }, { label: 'List / 30 days', num: true }, { label: 'Negotiated / 30 days', num: true }, { label: 'Below list', num: true }],
       sorted.map((d) => [d.name, String(d.cohort), fmtPrice(d.list_30day), fmtPrice(d.mfp_30day), fmtPct(1 - d.mfp_30day / d.list_30day)])
     ));
-
-    // Full table
     renderNegTable();
   }
 
